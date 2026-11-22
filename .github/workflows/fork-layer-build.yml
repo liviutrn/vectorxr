@@ -1,0 +1,238 @@
+name: VectorXR Fork Layer Build & Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_reason:
+        description: "Short written purpose for this build"
+        required: false
+        default: "Manual dispatch"
+        type: string
+      run_graphics_tests:
+        description: "Run D3D12/WARP graphics test suite"
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - "experiment/**"
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-layer-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  layer-cpu:
+    name: Build Release layer + CPU tests
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Layer build dependencies
+        uses: ./.github/actions/layer-dependencies
+
+      - name: Build OpenXR layer (Release) and run CPU tests
+        shell: pwsh
+        run: ./scripts/Build-Layer.ps1 -Configuration Release -Tests Cpu
+
+      - name: Package fork layer and offline RTX benchmark tools
+        shell: pwsh
+        env:
+          BUILD_REASON: ${{ github.event.inputs.build_reason || github.event.head_commit.message }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ID: ${{ github.run_id }}
+          REF_NAME: ${{ github.ref_name }}
+          FULL_SHA: ${{ github.sha }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $shortSha = $env:FULL_SHA.Substring(0, 8)
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "build\layer\Release"
+          $outRoot = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $layerStage = Join-Path $outRoot "layer-package"
+          $toolsStage = Join-Path $outRoot "bench-tools"
+          $layerArtifactDir = Join-Path $outRoot "layer-artifact"
+          $toolsArtifactDir = Join-Path $outRoot "tools-artifact"
+
+          New-Item -ItemType Directory -Path $layerStage, $toolsStage, $layerArtifactDir, $toolsArtifactDir -Force | Out-Null
+
+          $dllPath = Join-Path $releaseDir "XR_APILAYER_DIENERTECH_VECTORXR.dll"
+          $jsonPath = Join-Path $releaseDir "XR_APILAYER_DIENERTECH_VECTORXR.json"
+          $soundsDir = Join-Path $releaseDir "sounds"
+
+          foreach ($req in @($dllPath, $jsonPath, $soundsDir)) {
+            if (-not (Test-Path -LiteralPath $req)) {
+              throw "Expected Release output missing: $req"
+            }
+          }
+
+          Copy-Item -LiteralPath $dllPath -Destination $layerStage -Force
+          Copy-Item -LiteralPath $jsonPath -Destination $layerStage -Force
+          Copy-Item -LiteralPath $soundsDir -Destination (Join-Path $layerStage "sounds") -Recurse -Force
+
+          $describe = (git describe --tags --always --dirty 2>$null)
+          if (-not $describe) { $describe = $shortSha }
+          $reasonLine = ($env:BUILD_REASON -replace "`r?`n", " ").Trim()
+          $utcNow = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+          $buildInfo = @(
+            "workflow=VectorXR Fork Layer Build & Tests"
+            "run_number=$env:RUN_NUMBER"
+            "run_id=$env:RUN_ID"
+            "branch=$env:REF_NAME"
+            "commit=$env:FULL_SHA"
+            "short_sha=$shortSha"
+            "git_describe=$describe"
+            "configuration=Release"
+            "built_utc=$utcNow"
+            "reason=$reasonLine"
+          ) -join "`r`n"
+
+          Set-Content -LiteralPath (Join-Path $layerStage "BUILD_INFO.txt") -Value $buildInfo -Encoding utf8
+
+          $layerHashes = Get-ChildItem -Path $layerStage -Recurse -File | Sort-Object FullName | ForEach-Object {
+            $rel = [System.IO.Path]::GetRelativePath($layerStage, $_.FullName).Replace("\", "/")
+            $h = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$h  $rel"
+          }
+          Set-Content -LiteralPath (Join-Path $layerStage "SHA256SUMS.txt") -Value $layerHashes -Encoding ascii
+
+          $layerZipName = "VectorXR-fork-layer-$env:RUN_NUMBER-$shortSha.zip"
+          $layerZipPath = Join-Path $layerArtifactDir $layerZipName
+          Compress-Archive -Path (Join-Path $layerStage "*") -DestinationPath $layerZipPath -Force
+          $layerZipHash = (Get-FileHash -LiteralPath $layerZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$layerZipPath.sha256" -Value "$layerZipHash  $layerZipName" -Encoding ascii
+          Copy-Item -LiteralPath (Join-Path $layerStage "BUILD_INFO.txt") -Destination $layerArtifactDir -Force
+          Copy-Item -LiteralPath (Join-Path $layerStage "SHA256SUMS.txt") -Destination $layerArtifactDir -Force
+
+          $dllHash = (Get-FileHash -LiteralPath $dllPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $dllSize = (Get-Item -LiteralPath $dllPath).Length
+
+          # Package offline RTX benchmark & replay executables (separate from installable layer zip)
+          $toolFiles = @(
+            "depthxr_framegen_tests.exe",
+            "depthxr_framegen_interpolate_flow_hw_tests.exe",
+            "depthxr_framegen_runtime_queue_tests.exe",
+            "depthxr_framegen_presenter_tests.exe"
+          )
+          foreach ($tf in $toolFiles) {
+            $src = Join-Path $releaseDir $tf
+            if (Test-Path -LiteralPath $src) {
+              Copy-Item -LiteralPath $src -Destination $toolsStage -Force
+            } else {
+              Write-Warning "Bench tool not found: $src"
+            }
+          }
+
+          $vcpkgBin = Join-Path $env:GITHUB_WORKSPACE ".vcpkg\installed\x64-windows\bin\openxr_loader.dll"
+          $releaseLoader = Join-Path $releaseDir "openxr_loader.dll"
+          if (Test-Path -LiteralPath $releaseLoader) {
+            Copy-Item -LiteralPath $releaseLoader -Destination $toolsStage -Force
+          } elseif (Test-Path -LiteralPath $vcpkgBin) {
+            Copy-Item -LiteralPath $vcpkgBin -Destination $toolsStage -Force
+          }
+
+          Set-Content -LiteralPath (Join-Path $toolsStage "BUILD_INFO.txt") -Value $buildInfo -Encoding utf8
+          $toolHashes = Get-ChildItem -Path $toolsStage -Recurse -File | Sort-Object FullName | ForEach-Object {
+            $rel = [System.IO.Path]::GetRelativePath($toolsStage, $_.FullName).Replace("\", "/")
+            $h = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$h  $rel"
+          }
+          Set-Content -LiteralPath (Join-Path $toolsStage "SHA256SUMS.txt") -Value $toolHashes -Encoding ascii
+
+          $toolsZipName = "VectorXR-fork-bench-tools-$env:RUN_NUMBER-$shortSha.zip"
+          $toolsZipPath = Join-Path $toolsArtifactDir $toolsZipName
+          Compress-Archive -Path (Join-Path $toolsStage "*") -DestinationPath $toolsZipPath -Force
+          $toolsZipHash = (Get-FileHash -LiteralPath $toolsZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$toolsZipPath.sha256" -Value "$toolsZipHash  $toolsZipName" -Encoding ascii
+          Copy-Item -LiteralPath (Join-Path $toolsStage "BUILD_INFO.txt") -Destination $toolsArtifactDir -Force
+          Copy-Item -LiteralPath (Join-Path $toolsStage "SHA256SUMS.txt") -Destination $toolsArtifactDir -Force
+
+          "SHORT_SHA=$shortSha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $summary = @(
+            "### VectorXR Fork Layer Build #$env:RUN_NUMBER (``$shortSha``)"
+            ""
+            "- **Branch:** ``$env:REF_NAME``"
+            "- **Describe:** ``$describe``"
+            "- **Reason:** $reasonLine"
+            "- **Layer DLL:** ``XR_APILAYER_DIENERTECH_VECTORXR.dll`` ($dllSize bytes, SHA-256 ``$dllHash``)"
+            "- **Layer ZIP:** ``$layerZipName`` (SHA-256 ``$layerZipHash``)"
+            "- **Bench tools ZIP:** ``$toolsZipName`` (SHA-256 ``$toolsZipHash``)"
+          ) -join "`n"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8
+
+      - name: Upload fork layer artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VectorXR-fork-layer-${{ github.run_number }}-${{ env.SHORT_SHA }}
+          path: dist/layer-artifact/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload offline bench tools artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VectorXR-fork-bench-tools-${{ github.run_number }}-${{ env.SHORT_SHA }}
+          path: dist/tools-artifact/
+          if-no-files-found: error
+          retention-days: 30
+
+  layer-graphics:
+    name: Layer graphics tests (WARP)
+    if: github.event_name != 'workflow_dispatch' || inputs.run_graphics_tests == true
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Layer build dependencies
+        uses: ./.github/actions/layer-dependencies
+
+      - name: Build OpenXR layer and run graphics tests
+        shell: pwsh
+        run: ./scripts/Build-Layer.ps1 -Configuration Release -Tests Graphics
+
+      - name: Upload layer graphics test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: layer-graphics-test-logs-${{ github.run_number }}
+          path: ~/AppData/Local/Temp/vectorxr-*/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  verify:
+    name: Fork build and test gate
+    needs: [layer-cpu, layer-graphics]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check job results
+        env:
+          CPU: ${{ needs.layer-cpu.result }}
+          GRAPHICS: ${{ needs.layer-graphics.result }}
+          GFX_ENABLED: ${{ github.event_name != 'workflow_dispatch' || inputs.run_graphics_tests == true }}
+        run: |
+          echo "layer-cpu: $CPU; layer-graphics: $GRAPHICS (enabled=$GFX_ENABLED)"
+          test "$CPU" = success
+          if [ "$GFX_ENABLED" = "true" ]; then
+            test "$GRAPHICS" = success
+          fi
