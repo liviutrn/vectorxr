@@ -320,22 +320,6 @@ std::array<float, 2> EdgeFillDegrees() {
     return {kFrameGenEdgeFillHorizontalDegrees, kFrameGenEdgeFillVerticalDegrees};
 }
 
-// One history slot of these views, estimated: each view's image, and
-// depth, trust and flow at half resolution or less (about one and a half
-// images' worth); with the engine motion map (`map`, stage 7:
-// FrameGenPresenter::EngineMapRingLocked) the cells' labels too, 4 bytes per
-// flow cell at level 2 at most, and the world's motion kept beside them (a
-// committed texture of its own: 64 KiB).
-std::uint64_t HistorySlotBytes(const XrCompositionLayerProjectionView* views, std::size_t count, bool map) {
-    std::uint64_t bytes = 0;
-    for (std::size_t i = 0; views && i < count; ++i) {
-        const FrameGenExtent extent = Extent(views[i]);
-        bytes += std::uint64_t{extent.width} * extent.height * 6;
-        bytes += map ? std::uint64_t{extent.width} * extent.height / 4 + 64 * 1024 : 0;
-    }
-    return bytes;
-}
-
 std::string Number(double value, int decimals) {
     char buffer[32];
     std::snprintf(buffer, sizeof(buffer), "%.*f", decimals, value);
@@ -751,6 +735,31 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
     engine_window_ = {};
     gpu_frames_ahead_ = 1;
     gpu_timeouts_in_row_ = 0;
+    // VECTORXR_FRAMEGEN_DYNAMIC_RATE_CHECK=initial|always|off: controls
+    // benefit guard (e) (app_rate vs initial passthrough_fps_). Default is
+    // `initial` so variable-scene games do not suffer false 4-10 s stand-down
+    // probes minutes after engaging when entering heavier zones, while still
+    // catching immediate engagement-induced slowdowns.
+    dynamic_rate_check_ = DynamicRateCheck::kInitial;
+    dynamic_rate_ok_windows_ = 0;
+    dynamic_rate_confirmed_ = false;
+    if (const std::optional<std::string> rate_check = ReadResearchSwitch("VECTORXR_FRAMEGEN_DYNAMIC_RATE_CHECK");
+        rate_check && !rate_check->empty()) {
+        if (*rate_check == "off" || *rate_check == "0" || *rate_check == "false") {
+            dynamic_rate_check_ = DynamicRateCheck::kOff;
+        } else if (*rate_check == "on" || *rate_check == "always" || *rate_check == "1" || *rate_check == "true") {
+            dynamic_rate_check_ = DynamicRateCheck::kAlways;
+        } else if (*rate_check == "initial") {
+            dynamic_rate_check_ = DynamicRateCheck::kInitial;
+        }
+    }
+    if (logger_) {
+        const char* mode_name = dynamic_rate_check_ == DynamicRateCheck::kOff     ? "off"
+                                : dynamic_rate_check_ == DynamicRateCheck::kAlways ? "always"
+                                                                                   : "initial";
+        logger_->Info(std::string("Frame Generation dynamic rate check: ") + mode_name +
+                      " (VECTORXR_FRAMEGEN_DYNAMIC_RATE_CHECK).");
+    }
     // VECTORXR_FRAMEGEN_LEAD=events: the lead steps by hitch events
     // (FrameGenLeadPolicy::hitch_events), for comparisons in flight; off by
     // default until flown.
@@ -1183,6 +1192,8 @@ void FrameGenPresenter::Stop() {
     dynamic_probing_ = false;
     passthrough_fps_ = 0.0;
     dynamic_rate_check_fps_.reset();
+    dynamic_rate_ok_windows_ = 0;
+    dynamic_rate_confirmed_ = false;
     dynamic_reason_.clear();
     dynamic_engagements_ = dynamic_stand_downs_ = dynamic_probes_ = 0;
     standby_since_.reset();
@@ -1679,6 +1690,8 @@ void FrameGenPresenter::SetDynamicPolicy(const FrameGenDynamicPolicy& policy) {
     dynamic_hold_ = policy.hold;
     auto_halving_hold_ = policy.hold;
     dynamic_probe_after_ = policy.probe_after;
+    dynamic_rate_ok_windows_ = 0;
+    dynamic_rate_confirmed_ = false;
 }
 
 void FrameGenPresenter::SetSummaryInterval(std::chrono::milliseconds interval) {
@@ -2451,21 +2464,63 @@ void FrameGenPresenter::CaptureOnRelease(XrSwapchain swapchain, std::uint32_t im
     std::uint64_t captured = 0;
     bool color_captured = false;
     std::string failure;
-    for (Job& job : jobs) {
-        std::string error;
-        if (!gpu_->Track(swapchain, xr_.images, error) ||
-            !(job.depth ? gpu_->CaptureDepth(job.view, job.source, job.encoding, job.request, error)
-                        : gpu_->Capture(job.view, job.source, job.request, quality, error))) {
-            // Generation then copies the image itself. An empty error means
-            // the view is not set up for this region yet; nothing to report.
-            if (failure.empty()) {
-                failure = error;
+    if (!jobs.empty()) {
+        std::string track_error;
+        if (!gpu_->Track(swapchain, xr_.images, track_error)) {
+            failure = track_error;
+        } else {
+            std::vector<std::size_t> color_indices;
+            std::vector<FrameGenCaptureItem> color_batch;
+            color_indices.reserve(jobs.size());
+            color_batch.reserve(jobs.size());
+            for (std::size_t i = 0; i < jobs.size(); ++i) {
+                if (!jobs[i].depth) {
+                    color_indices.push_back(i);
+                    color_batch.push_back({jobs[i].view, jobs[i].source, jobs[i].request});
+                }
             }
-            continue;
+            if (color_batch.size() >= 2) {
+                std::string error;
+                std::vector<bool> ok_flags;
+                gpu_->CaptureBatch(color_batch, quality, error, &ok_flags);
+                if (failure.empty() && !error.empty()) {
+                    failure = error;
+                }
+                for (std::size_t k = 0; k < color_indices.size(); ++k) {
+                    if (k < ok_flags.size() && ok_flags[k]) {
+                        jobs[color_indices[k]].ok = true;
+                        ++captured;
+                        color_captured = true;
+                    }
+                }
+            } else if (color_batch.size() == 1) {
+                Job& job = jobs[color_indices[0]];
+                std::string error;
+                if (gpu_->Capture(job.view, job.source, job.request, quality, error)) {
+                    job.ok = true;
+                    ++captured;
+                    color_captured = true;
+                } else if (failure.empty()) {
+                    failure = error;
+                }
+            }
+            for (Job& job : jobs) {
+                if (!job.depth) {
+                    continue;
+                }
+                std::string error;
+                if (!gpu_->CaptureDepth(job.view, job.source, job.encoding, job.request, error)) {
+                    // Generation then copies the image itself. An empty error means
+                    // the view is not set up for this region yet; nothing to report.
+                    if (failure.empty()) {
+                        failure = error;
+                    }
+                    continue;
+                }
+                job.ok = true;
+                ++captured;
+            }
         }
-        job.ok = true;
-        ++captured;
-        color_captured = color_captured || !job.depth;
     }
     // The early census: whether the motion vectors are written by the time
     // the frame's depth is released (before its xrEndFrame).
@@ -3147,13 +3202,51 @@ bool FrameGenPresenter::EngineMapRingLocked() const {
            engine_capturable_ && gpu_ && gpu_->SupportsEngineMotion();
 }
 
+std::uint64_t FrameGenPresenter::HistorySlotBytesLocked(const XrCompositionLayerProjectionView* views, std::size_t count,
+                                                        const std::vector<std::uint8_t>* has_depth, bool cover,
+                                                        std::uint8_t final_level, bool map) const {
+    std::uint64_t bytes = 0;
+    const bool depth_enabled = settings_.use_game_depth && gpu_ && gpu_->SupportsDepth();
+    for (std::size_t i = 0; views && i < count; ++i) {
+        const FrameGenExtent extent = Extent(views[i]);
+        const auto levels = FrameGenPyramid(extent);
+        std::uint64_t color_bpp = 4;
+        if (gpu_) {
+            const auto record = swapchains_.find(views[i].subImage.swapchain);
+            if (record != swapchains_.end()) {
+                const auto kind = gpu_->Classify(record->second.format);
+                if (kind && *kind == FrameGenOutputKind::kFloat16) {
+                    color_bpp = 8;
+                }
+            }
+        }
+        bytes += std::uint64_t{extent.width} * extent.height * color_bpp;
+        const FrameGenExtent filtered = levels[final_level];
+        bytes += std::uint64_t{filtered.width} * filtered.height * 8 * (cover ? 2 : 1);
+        const bool view_depth = depth_enabled && has_depth && i < has_depth->size() && (*has_depth)[i] != 0;
+        if (view_depth) {
+            // Lazy linear depth (R32_FLOAT, 4 B/px) + trust (R16_FLOAT, 2 B/px) at half resolution.
+            bytes += std::uint64_t{levels[1].width} * levels[1].height * 6;
+        }
+        bytes += map ? std::uint64_t{extent.width} * extent.height / 4 + 64 * 1024 : 0;
+    }
+    return bytes;
+}
+
 std::uint8_t FrameGenPresenter::CanvasRingLocked() {
-    // Each further slot keeps a real frame per view (HistorySlotBytes).
+    // Each further slot keeps a real frame per view (HistorySlotBytesLocked).
     const FrameCopy& copy = newest_copy_.valid ? newest_copy_ : passthrough_copy_;
+    FrameGenTuning preview;
+    preview.quality = settings_.flow_quality;
+    preview.hardware_flow = settings_.motion_estimation == FrameGenMotionEstimation::kHardware;
+    const std::uint8_t final_level = FrameGenFinalFlowLevel(preview);
+    const bool cover = settings_.synthesis_mode == FrameGenSynthesisMode::kInterpolate;
     const std::uint64_t slot_bytes =
         copy.valid && copy.has_projection && copy.projection_index < copy.layers.size()
-            ? HistorySlotBytes(copy.layers[copy.projection_index].views.data(),
-                               copy.layers[copy.projection_index].views.size(), EngineMapRingLocked())
+            ? HistorySlotBytesLocked(copy.layers[copy.projection_index].views.data(),
+                                     copy.layers[copy.projection_index].views.size(),
+                                     &copy.layers[copy.projection_index].has_depth, cover, final_level,
+                                     EngineMapRingLocked())
             : 0;
     const std::uint8_t roomy = kFrameGenCanvasRingRoomy;
     const std::uint8_t lean = FrameGenHistoryRing(false);
@@ -3951,13 +4044,27 @@ void FrameGenPresenter::UpdateDynamicLocked(Clock::time_point now, XrDuration pe
     // alone cannot tell a game that engaging slowed (DCS through the
     // Direct3D 11 bridge, 2026-10-22: 44 fps passing through, 17 engaged,
     // still 90 distinct, engaged until Frame Generation was turned off).
+    // In default `initial` mode, once 2 consecutive clean windows confirm the
+    // game kept its rate after engaging, passthrough_fps_ is retired as stale
+    // so later heavy-scene transitions do not trigger false 4-10 s stand-downs
+    // while safety guards (a)-(d) and runtime halving stay active.
+    const bool check_rate = dynamic_rate_check_ == DynamicRateCheck::kAlways ||
+                            (dynamic_rate_check_ == DynamicRateCheck::kInitial && !dynamic_rate_confirmed_);
+    const bool rate_slow = passthrough_fps_ > 0.0 && app_rate < policy.game_rate_share * passthrough_fps_;
+    if (dynamic_rate_check_ == DynamicRateCheck::kInitial && !dynamic_rate_confirmed_ && passthrough_fps_ > 0.0) {
+        if (rate_slow) {
+            dynamic_rate_ok_windows_ = 0;
+        } else if (++dynamic_rate_ok_windows_ >= 2) {
+            dynamic_rate_confirmed_ = true;
+        }
+    }
     const std::array<bool, 5> failing{
         passthrough_fps_ > 0.0 && !winning,
         !winning && generated < policy.generated_share * gap,
         !winning && refreshes > 0 &&
             static_cast<double>(unready) > policy.unready_share * static_cast<double>(refreshes),
         !winning && timed > 0 && static_cast<double>(late) > policy.late_analyses_share * static_cast<double>(timed),
-        passthrough_fps_ > 0.0 && app_rate < policy.game_rate_share * passthrough_fps_,
+        check_rate && rate_slow,
     };
     for (std::size_t i = 0; i < failing.size(); ++i) {
         guard_failing_[i] = failing[i] ? guard_failing_[i] + 1 : 0;
@@ -4031,6 +4138,8 @@ void FrameGenPresenter::DynamicEngageLocked(Clock::time_point now, double rate, 
     guard_.valid = false;
     guard_failing_ = {};
     dynamic_rate_check_fps_.reset();
+    dynamic_rate_ok_windows_ = 0;
+    dynamic_rate_confirmed_ = false;
     ++dynamic_engagements_;
     if (probe_failed) {
         dynamic_probing_ = false;
@@ -4060,6 +4169,8 @@ void FrameGenPresenter::DynamicStandDownLocked(Clock::time_point now, const std:
     guard_failing_ = {};
     dynamic_reason_ = reason;
     dynamic_rate_check_fps_ = check_engaged_fps;
+    dynamic_rate_ok_windows_ = 0;
+    dynamic_rate_confirmed_ = false;
     if (check_engaged_fps) {
         // No hold yet: standing by, the game's own rate decides (e).
         dynamic_probing_ = false;
@@ -4107,6 +4218,8 @@ void FrameGenPresenter::DynamicReenableLocked(Clock::time_point now) {
     dynamic_below_since_.reset();
     dynamic_probing_ = false;
     dynamic_rate_check_fps_.reset();
+    dynamic_rate_ok_windows_ = 0;
+    dynamic_rate_confirmed_ = false;
     multiplier_changed_at_ = now;
     cadence_.clear();
     guard_.valid = false;
@@ -6533,7 +6646,13 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
         // frame's Execute sets them up too): CanvasRingLocked counts them as
         // in use.
         held_ring_ = FrameGenHistoryRing(tuning);
-        held_slot_bytes_ = HistorySlotBytes(projection.views, projection.viewCount, EngineMapRingLocked());
+        std::vector<std::uint8_t> has_depth(projection.viewCount, 0);
+        for (std::uint32_t i = 0; i < projection.viewCount && i < submissions.size(); ++i) {
+            has_depth[i] = submissions[i].request.depth ? 1 : 0;
+        }
+        held_slot_bytes_ = HistorySlotBytesLocked(projection.views, projection.viewCount, &has_depth,
+                                                  tuning.analyze_only && tuning.cover, FrameGenFinalFlowLevel(tuning),
+                                                  EngineMapRingLocked());
     } else if (!ok) {
         // A failed recording may have freed the views' history (Direct3D 12
         // rebuilds them): none counts as held, so the next run's ring is

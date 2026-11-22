@@ -39,6 +39,13 @@ struct FrameGenViewSubmission {
     FrameGenViewRequest request;
 };
 
+// One color view captured when its swapchain releases (FrameGenGpu::CaptureBatch).
+struct FrameGenCaptureItem {
+    std::size_t view{0};
+    FrameGenImage source;
+    FrameGenViewRequest request;
+};
+
 struct FrameGenExecuteResult {
     std::vector<bool> synthesized; // per view; false = the newest frame was written unchanged
     std::vector<bool> depth;       // per view; the newest frame's depth was used
@@ -216,6 +223,26 @@ class FrameGenGpu {
     // returns false with an empty error and Execute copies instead.
     virtual bool Capture(std::size_t view, const FrameGenImage& source, const FrameGenViewRequest& request,
                          FrameGenFlowQuality quality, std::string& error) = 0;
+    // Captures multiple color views released together (for example, both eyes
+    // of a double-wide stereo swapchain) in one submission when the backend
+    // supports it. Returns the number of items captured; when `captured` is
+    // provided it is sized to `items.size()` with per-item success.
+    virtual std::size_t CaptureBatch(const std::vector<FrameGenCaptureItem>& items, FrameGenFlowQuality quality,
+                                     std::string& error, std::vector<bool>* captured = nullptr) {
+        std::size_t count = 0;
+        if (captured) captured->assign(items.size(), false);
+        error.clear();
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            std::string item_error;
+            if (Capture(items[i].view, items[i].source, items[i].request, quality, item_error)) {
+                if (captured) (*captured)[i] = true;
+                ++count;
+            } else if (error.empty() && !item_error.empty()) {
+                error = std::move(item_error);
+            }
+        }
+        return count;
+    }
     // Like Capture, for the depth image the application submitted with
     // `view` (XrCompositionLayerDepthInfoKHR): converted to linear depth
     // for the view's next Execute, which then sets request.depth's mapping
@@ -307,6 +334,9 @@ class FrameGenGpu {
     // recorded so far; a real frame's frames written just in time share one
     // per view.
     virtual std::uint64_t ShadingRatesForTest() const { return 0; }
+    // Tests: capture command-list submissions recorded so far (a batched
+    // double-wide capture counts once).
+    virtual std::uint64_t CaptureSubmitsForTest() const { return 0; }
     // FrameGenTuning::hardware_flow: empty until asked for, then "active",
     // or why the hardware cannot be used (block matching measures motion).
     virtual std::string HardwareFlowStatus() const { return "this graphics API has no optical flow hardware support"; }

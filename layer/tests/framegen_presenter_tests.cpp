@@ -253,6 +253,8 @@ using TimePoint = std::chrono::steady_clock::time_point;
 struct GpuLog {
     std::atomic<int> executes{0};
     std::atomic<int> captures{0};
+    std::atomic<int> capture_batches{0};
+    std::atomic<int> capture_batch_items{0};
     int wait_idles{0};
     bool idle_fails{false}; // WaitIdle reports GPU work that did not finish
     bool fail{false};
@@ -498,6 +500,12 @@ class FakeGpu final : public FrameGenGpu {
         captured_[view] = {source.swapchain, source.image_index};
         return true;
     }
+    std::size_t CaptureBatch(const std::vector<FrameGenCaptureItem>& items, FrameGenFlowQuality quality,
+                             std::string& error, std::vector<bool>* captured = nullptr) override {
+        ++log_->capture_batches;
+        log_->capture_batch_items += static_cast<int>(items.size());
+        return FrameGenGpu::CaptureBatch(items, quality, error, captured);
+    }
     std::uint64_t CaptureMark() const override {
         std::scoped_lock lock(marks_mutex_);
         return mark_;
@@ -603,8 +611,16 @@ class FakeGpu final : public FrameGenGpu {
                 FrameGenHistoryState::kAll) {
                 ++log_->history_replacements;
             }
-            // As the presenter estimates a slot (an image and a half per view).
-            held_bytes += std::uint64_t{ring_size} * views[i].request.extent.width * views[i].request.extent.height * 6;
+            // As the presenter estimates a slot (HistorySlotBytesLocked):
+            // color Bpp + filtered flow (x2 with cover) + lazy depth/trust when depth is active.
+            const auto levels = FrameGenPyramid(views[i].request.extent);
+            const std::uint64_t color_bpp = views[i].request.output == FrameGenOutputKind::kFloat16 ? 8 : 4;
+            const FrameGenExtent filtered = levels[FrameGenFinalFlowLevel(tuning)];
+            const std::uint64_t slot_bytes =
+                std::uint64_t{views[i].request.extent.width} * views[i].request.extent.height * color_bpp +
+                std::uint64_t{filtered.width} * filtered.height * 8 * (tuning.analyze_only && tuning.cover ? 2 : 1) +
+                (views[i].request.depth && log_->depth ? std::uint64_t{levels[1].width} * levels[1].height * 6 : 0);
+            held_bytes += std::uint64_t{ring_size} * slot_bytes;
             const bool synthesized = history_[i].Effective(views[i].request).synthesize;
             history_[i].Commit(synthesized);
             result.synthesized.push_back(synthesized);
@@ -4343,6 +4359,35 @@ void TestDepthCapture() {
     Check(none.Status().depth == FrameGenDepthState::kNotSent, "depth: a game without depth is reported");
 }
 
+// Double-wide stereo swapchain (both eyes in one XrSwapchain): CaptureOnRelease
+// groups both color views into a single CaptureBatch call per release.
+void TestDoubleWideCaptureUsesBatch() {
+    FrameGenPresenter presenter;
+    GpuLog gpu;
+    Runtime runtime;
+    StartPresenter(presenter, gpu, FrameGenSynthesisMode::kInterpolate);
+    App app(presenter, runtime);
+    app.views[0].subImage.swapchain = kLeft;
+    app.views[0].subImage.imageRect = {{0, 0}, {1600, 1600}};
+    app.views[1].subImage.swapchain = kLeft;
+    app.views[1].subImage.imageRect = {{1600, 0}, {1600, 1600}};
+    for (int i = 0; i < 6; ++i) {
+        const XrFrameState state = app.Wait();
+        app.Begin();
+        app.image = (app.image + 1) % 3;
+        presenter.NoteRelease(kLeft, app.image);
+        presenter.CaptureOnRelease(kLeft, app.image);
+        Check(XR_SUCCEEDED(app.End(state.predictedDisplayTime)), "double-wide batch: end");
+    }
+    presenter.Stop();
+    Check(gpu.capture_batches >= 3 && gpu.capture_batch_items == 2 * gpu.capture_batches &&
+              gpu.captures == gpu.capture_batch_items,
+          "double-wide capture: expected 2 views per CaptureBatch call (batches=" +
+              std::to_string(gpu.capture_batches.load()) + ", items=" +
+              std::to_string(gpu.capture_batch_items.load()) + ", captures=" +
+              std::to_string(gpu.captures.load()) + ")");
+}
+
 // Research (VECTORXR_FRAMEGEN_SYNTH_EYE): extrapolating, generated frames'
 // eyes go where the chosen predictor puts them (damped: its share of the
 // movement); interpolating, they stay on the line between the pair.
@@ -7162,6 +7207,52 @@ void TestBenefitGuardGameSlowedByEngaging() {
             Check(!runtime.ordering_violation && !g_release_violation, name + ": calls stayed ordered");
         }
     }
+}
+
+// Once 2 consecutive post-settle guard windows confirm the game kept its rate
+// after engaging (default `initial` mode), a later transition into a heavier
+// scene (e.g. 45 -> 17 fps minutes into open-world gameplay while distinctFps
+// stays ~90) does not trigger a false passthrough probe or stand-down.
+void TestBenefitGuardSceneSlowdownAfterConfirmedEngagement() {
+    FrameGenPresenter presenter;
+    GpuLog gpu;
+    Runtime runtime;
+    runtime.paced = true;
+    std::unique_ptr<App> owned;
+    App* app = nullptr;
+    StartJit(presenter, gpu, FrameGenSynthesisMode::kInterpolate, FrameGenMultiplier::kDynamic, app, runtime, owned);
+    FrameGenDynamicPolicy policy = GuardDynamic();
+    policy.hold = 3000ms;
+    presenter.SetDynamicPolicy(policy);
+
+    auto run_for = [&](std::chrono::milliseconds duration, std::chrono::microseconds work,
+                       const std::function<bool()>& until = {}) {
+        const auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < duration) {
+            const XrFrameState state = app->Wait();
+            app->Begin();
+            SleepPrecise(std::chrono::steady_clock::now() + work);
+            app->Release();
+            Check(XR_SUCCEEDED(app->End(state.predictedDisplayTime)), "confirmed scene slowdown: end");
+            if (until && until()) break;
+        }
+    };
+
+    run_for(3000ms, std::chrono::microseconds(19'000), [&] { return Engaged(presenter); });
+    Check(Engaged(presenter), "confirmed scene slowdown: dynamic engages at ~45 fps");
+    // Stay healthy (~40 fps >= 0.75 * 45) across settle (200 ms) + 2+ guard windows (600+ ms).
+    run_for(1050ms, std::chrono::microseconds(24'000));
+    Check(Engaged(presenter) && presenter.Status().dynamic_stand_downs == 0 &&
+              presenter.Status().dynamic_engagements == 1,
+          "confirmed scene slowdown: stays engaged during healthy confirmation windows");
+    // Enter a heavier scene (~17 fps < 0.75 * 45) for >3 guard windows while FG still fills refreshes.
+    run_for(1100ms, std::chrono::microseconds(58'000));
+    const FrameGenStatus status = presenter.Status();
+    Check(Engaged(presenter) && status.dynamic_stand_downs == 0 && status.dynamic_engagements == 1,
+          "confirmed scene slowdown: no false stand-down or passthrough probe after rate confirmation (" +
+              status.dynamic_reason + ")");
+    presenter.Stop();
+    Check(!runtime.ordering_violation && !g_release_violation, "confirmed scene slowdown: calls stayed ordered");
 }
 
 // A guard window left out (a pause, a loading frame) is not evidence for
@@ -10439,8 +10530,9 @@ void TestDepthDescriptionLogged() {
 void TestCanvasRingAcrossEngagements() {
     SessionLog log("canvas-ring");
     constexpr std::uint64_t kBudget = 4ull << 30;
-    // A slot of the App's two 1600x1600 views, as HistorySlotBytes estimates it.
-    constexpr std::uint64_t kSlot = 2ull * 1600 * 1600 * 6;
+    // A slot of the App's two 1600x1600 depthless 8-bit views (Extrapolate,
+    // level-3 200x200 filtered flow), as HistorySlotBytesLocked estimates it.
+    constexpr std::uint64_t kSlot = 2ull * (1600ull * 1600ull * 4ull + 200ull * 200ull * 8ull);
     // The game's own share (the history held is on top) below which five
     // are chosen (the two extra slots and a tenth of the budget to spare),
     // and kept (a twentieth); counted twice, five were dropped from
@@ -15998,6 +16090,7 @@ void RunPolicyTests() {
     RUN(TestDynamicHysteresis);
     RUN(TestBenefitGuardBacksOff);
     RUN(TestBenefitGuardGameSlowedByEngaging);
+    RUN(TestBenefitGuardSceneSlowdownAfterConfirmedEngagement);
     RUN(TestGpuPacingIgnoresPausedWindows);
     RUN(TestDynamicProbe);
     RUN(TestExtrapolateDuplicateTargetGuard);
@@ -16130,6 +16223,7 @@ int main(int argc, char** argv) {
     RUN(TestEdgeFillMargins);
     RUN(TestEdgeFill);
     RUN(TestDepthCapture);
+    RUN(TestDoubleWideCaptureUsesBatch);
     RUN(TestEyePredictionSwitch);
     RUN(TestEngineMotionCensus);
     RUN(TestEngineMotionGates);

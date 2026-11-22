@@ -1589,7 +1589,15 @@ class FrameGenPresenter {
     // through; engaged, the game runs at its own rate (released at most once
     // a refresh), generated frames fill the refreshes it misses, and the
     // benefit guard watches what generation adds.
+    enum class DynamicRateCheck : std::uint8_t {
+        kInitial, // check (e) only until engagement rate is confirmed across 2 clean windows
+        kAlways,  // upstream behavior: check (e) against passthrough_fps_ for the entire engagement
+        kOff,     // disable (e); keep safety guards (a)-(d) and runtime halving active
+    };
     FrameGenDynamicPolicy dynamic_policy_;
+    DynamicRateCheck dynamic_rate_check_{DynamicRateCheck::kInitial};
+    std::uint32_t dynamic_rate_ok_windows_{0};
+    bool dynamic_rate_confirmed_{false};
     bool dynamic_standby_{true};
     std::optional<std::chrono::steady_clock::time_point> dynamic_below_since_;
     std::chrono::steady_clock::time_point dynamic_hold_until_{};
@@ -2025,6 +2033,9 @@ class FrameGenPresenter {
     // those slots once.
     std::uint8_t held_ring_{0};
     std::uint64_t held_slot_bytes_{0};
+    std::uint64_t HistorySlotBytesLocked(const XrCompositionLayerProjectionView* views, std::size_t count,
+                                         const std::vector<std::uint8_t>* has_depth, bool cover,
+                                         std::uint8_t final_level, bool map) const;
     std::uint8_t CanvasRingLocked();
     // Stage 7: whether the views' ring slots hold the engine motion map's
     // labels and world motion (counted per slot): the map on, the vectors

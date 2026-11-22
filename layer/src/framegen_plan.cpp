@@ -867,7 +867,7 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
         // as rendered need no pack, and the unpack takes the head movement
         // out of its vectors.
         if (!request.hardware_raw) {
-            FrameGenDispatch pack = Dispatch(FrameGenPass::kFlowPack, plan.levels[1], plan.levels[1], base);
+            FrameGenDispatch pack = Dispatch(FrameGenPass::kFlowPack, plan.levels[1], {0, 0}, base);
             pack.inputs = {Texture(FrameGenTextureKind::kLumaNewest, 1), Texture(FrameGenTextureKind::kLumaPrevious, 1),
                            {}, {}, {}};
             pack.outputs = {Texture(FrameGenTextureKind::kHardwareNewest), Texture(FrameGenTextureKind::kHardwarePrevious)};
@@ -3950,7 +3950,7 @@ std::optional<std::string> ReadResearchSwitch(const char* name) {
     const std::string_view wanted(name);
     if (wanted.rfind("VECTORXR_FRAMEGEN_ENGINE_", 0) != 0 && wanted.rfind("VECTORXR_FRAMEGEN_DEPTH_", 0) != 0 &&
         wanted.rfind("VECTORXR_FRAMEGEN_SYNTH_", 0) != 0 && wanted.rfind("VECTORXR_FRAMEGEN_FLOW_", 0) != 0 &&
-        wanted != "VECTORXR_FRAMEGEN_WORLD") {
+        wanted.rfind("VECTORXR_FRAMEGEN_DYNAMIC_", 0) != 0 && wanted != "VECTORXR_FRAMEGEN_WORLD") {
         return std::nullopt;
     }
     const std::filesystem::path local = LocalAppDataPath();

@@ -4268,10 +4268,11 @@ int RunQuadViews(Harness& harness) {
         for (std::size_t i = 0; i < 4; ++i) {
             const auto levels = FrameGenPyramid(views[i].extent);
             const FrameGenExtent filtered = levels[FrameGenFinalFlowLevel(tuning)];
+            // Depth rings are allocated lazily on first depth capture, so
+            // depthless views do not pay for R32_FLOAT depth per ring slot.
             slot += allocation(views[i].extent, static_cast<ID3D12Resource*>(g_swapchains[sources[i]][0])->GetDesc().Format,
                                false) +
-                    2 * allocation(filtered, DXGI_FORMAT_R16G16B16A16_FLOAT, true) +
-                    allocation(levels[1], DXGI_FORMAT_R32_FLOAT, true);
+                    2 * allocation(filtered, DXGI_FORMAT_R16G16B16A16_FLOAT, true);
         }
         const std::uint64_t slots = FrameGenHistoryRing(true) - FrameGenHistoryRing(false);
         std::cout << harness.name << " history ring: quad views " << bytes[0] / 1024 << " KiB, not composed "
@@ -5977,6 +5978,12 @@ int RunProfile(Harness& harness) {
     double engine_ms = 0.0;
     std::size_t engine_samples = 0;
     std::uint64_t engine_seen = 0;
+    const bool no_depth =
+        std::getenv("FG_PROFILE_NODEPTH") && std::string(std::getenv("FG_PROFILE_NODEPTH")) == "1";
+    const std::uint8_t profile_ring =
+        std::getenv("FG_PROFILE_RING") ? static_cast<std::uint8_t>(std::clamp(std::atoi(std::getenv("FG_PROFILE_RING")), 0, 5)) : 0;
+    const bool only_hardware =
+        std::getenv("FG_PROFILE_ONLY_HARDWARE") && std::string(std::getenv("FG_PROFILE_ONLY_HARDWARE")) == "1";
     // A real frame's two views, captured at release as the presenter does:
     // color, then depth; with FG_PROFILE_MV, then the frame's motion vectors
     // (as the layer at its xrEndFrame), copied into `dump` too when given.
@@ -6002,7 +6009,7 @@ int RunProfile(Harness& harness) {
             view.request.output = FrameGenOutputKind::kSrgb8;
             view.request.synthesize = true;
             view.request.temporal = true;
-            view.request.depth = true;
+            view.request.depth = !no_depth;
             // The head moving 2 cm per real frame (a fast turn; FG_PROFILE_EYE_MM
             // sets it): generated frames follow the eye.
             const char* eye_mm = std::getenv("FG_PROFILE_EYE_MM");
@@ -6032,10 +6039,12 @@ int RunProfile(Harness& harness) {
         for (std::size_t eye = 0; eye < 2; ++eye) {
             const bool captured = backend.Capture(eye, views[eye].source, views[eye].request, quality, error);
             Check(captured || error.empty(), "capture: " + error);
-            const XrRect2Di depth_rect{{0, 0}, {static_cast<int>(depth_width), static_cast<int>(depth_height)}};
-            const bool depth_captured =
-                backend.CaptureDepth(eye, {depths[eye], 0, 0, depth_rect, 0}, encoding, views[eye].request, error);
-            Check(depth_captured || error.empty(), "depth capture: " + error);
+            if (!no_depth) {
+                const XrRect2Di depth_rect{{0, 0}, {static_cast<int>(depth_width), static_cast<int>(depth_height)}};
+                const bool depth_captured =
+                    backend.CaptureDepth(eye, {depths[eye], 0, 0, depth_rect, 0}, encoding, views[eye].request, error);
+                Check(depth_captured || error.empty(), "depth capture: " + error);
+            }
         }
         if (engine) {
             std::vector<FrameGenMotionJob> jobs(2);
@@ -6068,6 +6077,7 @@ int RunProfile(Harness& harness) {
         std::getenv("FG_PROFILE_PERFORMANCE") && std::string(std::getenv("FG_PROFILE_PERFORMANCE")) == "1";
     for (const int config : {0, 1, 2, 3}) {
         if (config == 3 && !performance) continue;
+        if (only_hardware && config != 2) continue;
         const auto quality = config == 1   ? FrameGenFlowQuality::kQuality
                              : config == 3 ? FrameGenFlowQuality::kPerformance
                                            : FrameGenFlowQuality::kBalanced;
@@ -6129,6 +6139,9 @@ int RunProfile(Harness& harness) {
             FrameGenTuning executed = tuning;
             executed.analyze_only = jit;
             executed.cover = jit && interpolate;
+            if (profile_ring >= 2) {
+                executed.history_ring = profile_ring;
+            }
             executed.engine_mode = engine_mode;
             // The level as the presenter pins it from Assist with the hardware
             // chosen (FrameGenTuning::hardware_level).
@@ -10958,6 +10971,237 @@ void AllocationFailureRecoveryTest(Harness& harness) {
     g_swapchains.erase(source);
 }
 
+// Sprint 1 (Rank #1 + Rank #4): verifies double-wide batched capture executes
+// a single D3D12 submission per stereo release with exact left/right pixels,
+// lazy depth and shader-flow pyramid allocation reclaim dead VRAM, and
+// hardware atlas direct-pack omits redundant per-view input images.
+void Sprint1VramAndBatchedCaptureTest(Harness& harness, ID3D12Device* device) {
+    auto allocation = [&](FrameGenExtent extent, DXGI_FORMAT format, bool uav) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = extent.width;
+        desc.Height = extent.height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = format;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        return device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    };
+
+    const std::uint32_t eye_w = 320, eye_h = 320;
+    const XrSwapchain wide_source = reinterpret_cast<XrSwapchain>(std::uintptr_t{0x5b1d00});
+    const XrSwapchain out_left = reinterpret_cast<XrSwapchain>(std::uintptr_t{0x5b1d01});
+    const XrSwapchain out_right = reinterpret_cast<XrSwapchain>(std::uintptr_t{0x5b1d02});
+    const XrSwapchain depth_sc = reinterpret_cast<XrSwapchain>(std::uintptr_t{0x5b1d03});
+
+    auto make_wide = [&](std::uint32_t shift) {
+        Pixels img(std::size_t{eye_w * 2} * eye_h, 0xff202020u);
+        for (std::uint32_t y = 0; y < eye_h; ++y) {
+            for (std::uint32_t x = 0; x < eye_w; ++x) {
+                // Distinct left (reddish gradient + square) and right (bluish gradient + square).
+                const bool lsq = x >= 24 + shift && x < 56 + shift && y >= 40 && y < 72;
+                const std::uint8_t lr = lsq ? 240u : static_cast<std::uint8_t>(40 + (x * 120) / eye_w);
+                const std::uint8_t lg = lsq ? 220u : static_cast<std::uint8_t>(20 + (y * 60) / eye_h);
+                const std::uint8_t lb = lsq ? 60u : 30u;
+                img[std::size_t{y} * (eye_w * 2) + x] =
+                    0xff000000u | (static_cast<std::uint32_t>(lb) << 16) | (static_cast<std::uint32_t>(lg) << 8) | lr;
+
+                const bool rsq = x >= 48 + shift && x < 80 + shift && y >= 56 && y < 88;
+                const std::uint8_t rr = rsq ? 60u : 25u;
+                const std::uint8_t rg = rsq ? 230u : static_cast<std::uint8_t>(30 + (y * 70) / eye_h);
+                const std::uint8_t rb = rsq ? 245u : static_cast<std::uint8_t>(50 + (x * 130) / eye_w);
+                img[std::size_t{y} * (eye_w * 2) + (eye_w + x)] =
+                    0xff000000u | (static_cast<std::uint32_t>(rb) << 16) | (static_cast<std::uint32_t>(rg) << 8) | rr;
+            }
+        }
+        return img;
+    };
+    auto crop_half = [&](const Pixels& wide, std::uint32_t x0) {
+        Pixels half(std::size_t{eye_w} * eye_h);
+        for (std::uint32_t y = 0; y < eye_h; ++y) {
+            std::memcpy(&half[std::size_t{y} * eye_w], &wide[std::size_t{y} * (eye_w * 2) + x0],
+                        std::size_t{eye_w} * sizeof(std::uint32_t));
+        }
+        return half;
+    };
+
+    const Pixels wide0 = make_wide(0);
+    const Pixels wide1 = make_wide(6);
+    g_swapchains[wide_source] = {harness.create(eye_w * 2, eye_h), harness.create(eye_w * 2, eye_h)};
+    harness.upload_sized(g_swapchains[wide_source][0], eye_w * 2, eye_h, wide0);
+    harness.upload_sized(g_swapchains[wide_source][1], eye_w * 2, eye_h, wide1);
+    g_swapchains[out_left] = {harness.create(eye_w, eye_h)};
+    g_swapchains[out_right] = {harness.create(eye_w, eye_h)};
+    g_swapchains[depth_sc] = {harness.create_depth_sized(eye_w, eye_h, 0.5f, {{0, 0}, {static_cast<int>(eye_w), static_cast<int>(eye_h)}}, 1.0f)};
+
+    std::string error;
+    auto gpu = CreateFrameGenGpu(harness.binding, error);
+    Check(gpu != nullptr, "Sprint1 test backend: " + error);
+    Check(gpu->Track(wide_source, EnumerateImages, error) && gpu->Track(out_left, EnumerateImages, error) &&
+              gpu->Track(out_right, EnumerateImages, error) && gpu->Track(depth_sc, EnumerateImages, error),
+          "Sprint1 test track: " + error);
+
+    const auto make_views = [&](std::uint32_t image_index, bool synth) {
+        std::vector<FrameGenViewSubmission> views(2);
+        for (std::size_t eye = 0; eye < 2; ++eye) {
+            const XrRect2Di rect{{static_cast<int>(eye * eye_w), 0}, {static_cast<int>(eye_w), static_cast<int>(eye_h)}};
+            views[eye].source = {wide_source, image_index, 0, rect, harness.format};
+            views[eye].request.extent = {eye_w, eye_h};
+            views[eye].request.output = FrameGenOutputKind::kSrgb8;
+            views[eye].request.synthesize = synth;
+            views[eye].request.temporal = synth;
+            views[eye].request.depth = false;
+            for (auto* g : {&views[eye].request.newest, &views[eye].request.previous}) {
+                g->angle_left = -0.7f;
+                g->angle_right = 0.7f;
+                g->angle_up = 0.7f;
+                g->angle_down = -0.7f;
+            }
+        }
+        return views;
+    };
+
+    FrameGenTuning tuning;
+    tuning.mode = FrameGenSynthesisMode::kInterpolate;
+    tuning.analyze_only = true;
+    tuning.cover = true;
+    tuning.history_ring = 5;
+    tuning.hardware_flow = false; // deterministic across WARP and RTX for part 1
+
+    // 1. Setup via initial uncaptured Execute (prepares both views, no depth allocated).
+    FrameGenExecuteResult res;
+    Check(!gpu->Execute(make_views(0, false), tuning, res, error) && res.uncaptured,
+          "Sprint1 setup expected uncaptured: " + error);
+
+    // 2. Batched double-wide capture submits ONCE for both eyes and copies exact halves.
+    const std::uint64_t submits_before = gpu->CaptureSubmitsForTest();
+    auto views0 = make_views(0, false);
+    std::vector<FrameGenCaptureItem> batch0{{0, views0[0].source, views0[0].request},
+                                            {1, views0[1].source, views0[1].request}};
+    std::vector<bool> ok_flags;
+    Check(gpu->CaptureBatch(batch0, tuning.quality, error, &ok_flags) == 2 && error.empty() &&
+              ok_flags.size() == 2 && ok_flags[0] && ok_flags[1],
+          "Sprint1 CaptureBatch frame 0 failed: " + error);
+    Check(gpu->CaptureSubmitsForTest() == submits_before + 1,
+          "Sprint1 double-wide CaptureBatch did not batch into 1 submission (" +
+              std::to_string(gpu->CaptureSubmitsForTest() - submits_before) + ")");
+    const std::uint64_t mark0 = gpu->CaptureMark();
+    Check(mark0 > 0 && gpu->WaitCapture(mark0, std::chrono::milliseconds(1000)) && gpu->CaptureReached(mark0),
+          "Sprint1 CaptureMark/WaitCapture failed");
+
+    res = {};
+    Check(gpu->Execute(views0, tuning, res, error) && res.frame != 0, "Sprint1 Execute 0 failed: " + error);
+    const std::vector<FrameGenImage> outs{
+        {out_left, 0, 0, {{0, 0}, {static_cast<int>(eye_w), static_cast<int>(eye_h)}}, harness.format},
+        {out_right, 0, 0, {{0, 0}, {static_cast<int>(eye_w), static_cast<int>(eye_h)}}, harness.format},
+    };
+    Check(gpu->Synthesize(res.frame, tuning.mode, 1.0f, outs, error) && gpu->WaitIdle(),
+          "Sprint1 Synthesize exact 0 failed: " + error);
+    const Pixels got_left = harness.readback_sized(g_swapchains[out_left][0]);
+    const Pixels got_right = harness.readback_sized(g_swapchains[out_right][0]);
+    const Pixels want_left = crop_half(wide0, 0);
+    const Pixels want_right = crop_half(wide0, eye_w);
+    const auto all_pixels = [](std::uint32_t, std::uint32_t) { return true; };
+    Check(Compare(got_left, want_left, {eye_w, eye_h}, all_pixels).max <= 2 &&
+              Compare(got_right, want_right, {eye_w, eye_h}, all_pixels).max <= 2,
+          "Sprint1 batched double-wide capture did not preserve exact left/right halves");
+    Check(Compare(got_left, want_right, {eye_w, eye_h}, all_pixels).mean > 0.05,
+          "Sprint1 left and right test patterns were not distinct");
+
+    // Frame 1 batched capture + interpolated synthesis.
+    auto views1 = make_views(1, true);
+    std::vector<FrameGenCaptureItem> batch1{{0, views1[0].source, views1[0].request},
+                                            {1, views1[1].source, views1[1].request}};
+    Check(gpu->CaptureBatch(batch1, tuning.quality, error, &ok_flags) == 2 && error.empty(),
+          "Sprint1 CaptureBatch frame 1 failed: " + error);
+    Check(gpu->CaptureSubmitsForTest() == submits_before + 2,
+          "Sprint1 frame 1 CaptureBatch did not batch into 1 submission");
+    res = {};
+    Check(gpu->Execute(views1, tuning, res, error) && res.frame != 0, "Sprint1 Execute 1 failed: " + error);
+    Check(gpu->Synthesize(res.frame, tuning.mode, 0.5f, outs, error) && gpu->WaitIdle(),
+          "Sprint1 Synthesize interp 1 failed: " + error);
+
+    // Partial-prepared batch: view 1 mismatched extent must leave ok_flags[1]=false while capturing view 0 cleanly.
+    std::vector<FrameGenCaptureItem> partial = batch0;
+    partial[1].request.extent = {64, 64};
+    Check(gpu->CaptureBatch(partial, tuning.quality, error, &ok_flags) == 1 && error.empty() &&
+              ok_flags.size() == 2 && ok_flags[0] && !ok_flags[1],
+          "Sprint1 partial CaptureBatch behaved unexpectedly: " + error);
+    Check(gpu->WaitIdle(), "Sprint1 partial WaitIdle");
+
+    // 3. Lazy depth allocation: working memory grows by exact 2 * 5 * R32F half-res only after CaptureDepth.
+    const std::uint64_t bytes_before_depth = gpu->WorkingMemoryBytes();
+    const auto levels = FrameGenPyramid({eye_w, eye_h});
+    const std::uint64_t expected_depth_ring = 2ull * 5ull * allocation(levels[1], DXGI_FORMAT_R32_FLOAT, true);
+    FrameGenDepthEncoding enc;
+    const FrameGenImage depth_img{depth_sc, 0, 0, {{0, 0}, {static_cast<int>(eye_w), static_cast<int>(eye_h)}}, 0};
+    Check(gpu->CaptureDepth(0, depth_img, enc, views0[0].request, error) &&
+              gpu->CaptureDepth(1, depth_img, enc, views0[1].request, error) && gpu->WaitIdle(),
+          "Sprint1 lazy CaptureDepth failed: " + error);
+    const std::uint64_t bytes_after_depth = gpu->WorkingMemoryBytes();
+    Check(bytes_after_depth == bytes_before_depth + expected_depth_ring,
+          "Sprint1 lazy depth allocation delta mismatch: got " + std::to_string(bytes_after_depth - bytes_before_depth) +
+              ", expected " + std::to_string(expected_depth_ring));
+    gpu->Reset();
+
+    // 4. Hardware OFA atlas direct-pack & lazy shader pyramid (real GPU with NVOF).
+    if (g_hardware && g_flow_status == "active") {
+        auto hw_gpu = CreateFrameGenGpu(harness.binding, error);
+        Check(hw_gpu != nullptr && hw_gpu->Track(wide_source, EnumerateImages, error), "Sprint1 HW backend: " + error);
+        hw_gpu->SetHardwareAtlas(true);
+        FrameGenTuning hw_tuning = tuning;
+        hw_tuning.hardware_flow = true;
+        res = {};
+        Check(!hw_gpu->Execute(views0, hw_tuning, res, error) && res.uncaptured, "Sprint1 HW setup: " + error);
+        Check(hw_gpu->CaptureBatch(batch0, hw_tuning.quality, error) == 2, "Sprint1 HW batch 0: " + error);
+        res = {};
+        Check(hw_gpu->Execute(views0, hw_tuning, res, error), "Sprint1 HW Execute 0: " + error);
+        Check(hw_gpu->CaptureBatch(batch1, hw_tuning.quality, error) == 2, "Sprint1 HW batch 1: " + error);
+        res = {};
+        Check(hw_gpu->Execute(views1, hw_tuning, res, error) && hw_gpu->WaitIdle(), "Sprint1 HW Execute 1: " + error);
+        if (hw_gpu->UsesHardwareAtlasForTest()) {
+            const DXGI_FORMAT src_fmt = static_cast<ID3D12Resource*>(g_swapchains[wide_source][0])->GetDesc().Format;
+            const FrameGenExtent hw_input = levels[1];
+            const FrameGenExtent hw_flow = levels[kFrameGenHardwareFlowLevel];
+            const std::uint32_t align_w = (hw_input.width + 7u) & ~7u;
+            const std::uint32_t align_h = (hw_input.height + 7u) & ~7u;
+            const FrameGenExtent atlas_ext{align_w * 2u + 64u, align_h};
+            const FrameGenExtent atlas_flow{(atlas_ext.width + 3u) / 4u, (atlas_ext.height + 3u) / 4u};
+            const std::uint64_t per_view =
+                5ull * allocation({eye_w, eye_h}, src_fmt, false) +
+                10ull * allocation(hw_flow, DXGI_FORMAT_R16G16B16A16_FLOAT, true) + // filtered + filtered_cover
+                2ull * allocation(hw_input, DXGI_FORMAT_R16_FLOAT, true) +          // luma_newest/previous[1]
+                allocation(hw_flow, DXGI_FORMAT_R16G16B16A16_FLOAT, true) +         // flow[3]
+                allocation(hw_flow, DXGI_FORMAT_R16G16_SINT, false);                // hardware_flow only (no per-view inputs)
+            const std::uint64_t expected_hw =
+                2ull * per_view + 2ull * allocation(atlas_ext, DXGI_FORMAT_R8_UNORM, true) +
+                allocation(atlas_flow, DXGI_FORMAT_R16G16_SINT, false);
+            const std::uint64_t actual_hw = hw_gpu->WorkingMemoryBytes();
+            Check(actual_hw == expected_hw,
+                  "Sprint1 HW atlas WorkingMemoryBytes mismatch: actual " + std::to_string(actual_hw) +
+                      ", expected " + std::to_string(expected_hw));
+
+            // Mid-session fallback from hardware OFA -> shader flow lazily allocates pyramid levels cleanly.
+            FrameGenTuning sw_tuning = hw_tuning;
+            sw_tuning.hardware_flow = false;
+            Check(hw_gpu->CaptureBatch(batch0, sw_tuning.quality, error) == 2, "Sprint1 HW->SW batch: " + error);
+            res = {};
+            Check(hw_gpu->Execute(views0, sw_tuning, res, error) && hw_gpu->WaitIdle(),
+                  "Sprint1 HW->SW lazy fallback Execute failed: " + error);
+            Check(hw_gpu->WorkingMemoryBytes() > actual_hw,
+                  "Sprint1 HW->SW fallback did not lazily allocate shader pyramid");
+        }
+        hw_gpu->Reset();
+    }
+
+    g_swapchains.erase(wide_source);
+    g_swapchains.erase(out_left);
+    g_swapchains.erase(out_right);
+    g_swapchains.erase(depth_sc);
+    std::cout << harness.name << " Sprint 1 VRAM & batched double-wide capture test passed\n";
+}
+
 // --- Engine motion vectors, stage 0 (Direct3D 12) ----------------------------
 
 // IEEE half floats, for motion vector images and their dumps.
@@ -15563,6 +15807,7 @@ int D3D12Test() {
                  : g_bench   ? RunBench(harness)
                              : RunScenarios(harness);
     if (result == 0 && !g_replay && !g_contention && !g_profile && !g_bench) {
+        Sprint1VramAndBatchedCaptureTest(harness, device.Get());
         result = RunQuadViews(harness);
     }
     CloseHandle(event);

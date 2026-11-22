@@ -2948,6 +2948,8 @@ FG_BIND(5) FG_FORMAT("r8") RWTexture2D<float> g_hardware_previous : register(u1)
 // The half-resolution luma pair (the previous frame already in the newest
 // view) as 8-bit images for the optical flow hardware. Previous texels
 // outside the previous view take the newest frame's: no motion there.
+// g.size.zw holds the destination origin inside the target image ({0, 0} for
+// per-view images, or the view's cell offset inside a multi-view atlas).
 [numthreads(8, 8, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= g.size.xy)) {
@@ -2955,8 +2957,9 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
     }
     const float current = g_luma_current.Load(int3(id.xy, 0)).r;
     const float previous = g_luma_previous.Load(int3(id.xy, 0)).r;
-    g_hardware_current[id.xy] = saturate(current);
-    g_hardware_previous[id.xy] = saturate(previous < 0.0 ? current : previous);
+    const uint2 destination = id.xy + g.size.zw;
+    g_hardware_current[destination] = saturate(current);
+    g_hardware_previous[destination] = saturate(previous < 0.0 ? current : previous);
 }
 #endif
 

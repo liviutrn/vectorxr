@@ -396,6 +396,7 @@ enum class RecordUntil { kEnd, kHardware, kVerdicts };
 // One view's recording: a plan recorded up to `next`, resumable after the
 // optical flow hardware and after every view's verdict on the game's vectors.
 struct ViewRecording {
+    std::size_t view_index{0};
     const FrameGenViewSubmission* submission{nullptr};
     ViewResources* view{nullptr};
     FrameGenViewRequest request; // as planned (the history state's effective request)
@@ -1001,8 +1002,8 @@ class D3D12FrameGen final : public FrameGenGpu {
         ID3D12Resource* resource = it->second[source.image_index];
         // Capture never reallocates; Execute sets the view up first.
         static_cast<void>(quality); // the flow level does not affect the history images
-        if (!view.depth[1].resource || !view.history_state.MatchesImages(request.extent, resource->GetDesc().Format,
-                                                                      request.output)) {
+        if (!ViewPrepared(view) || !view.history_state.MatchesImages(request.extent, resource->GetDesc().Format,
+                                                                     request.output)) {
             error.clear();
             return false;
         }
@@ -1067,6 +1068,169 @@ class D3D12FrameGen final : public FrameGenGpu {
             MatchRaw(view, watch);
         }
         return true;
+    }
+
+    std::size_t CaptureBatch(const std::vector<FrameGenCaptureItem>& items, FrameGenFlowQuality quality,
+                             std::string& error, std::vector<bool>* captured = nullptr) override {
+        if (captured) captured->assign(items.size(), false);
+        error.clear();
+        // Single-view captures, or the inline raw-pack path (!separate_, which
+        // uses one descriptor block per CaptureSlot), stay on per-item Capture.
+        if (items.size() <= 1 || (!separate_ && hardware_active_ && !hardware_failed_)) {
+            return FrameGenGpu::CaptureBatch(items, quality, error, captured);
+        }
+        HRESULT hr = DeviceRemovedReason();
+        if (FAILED(hr)) {
+            error = Failure("D3D12 device", hr);
+            return 0;
+        }
+        static_cast<void>(quality); // the flow level does not affect the history images
+        std::vector<std::size_t> eligible;
+        eligible.reserve(items.size());
+        ID3D12Resource* common_source = nullptr;
+        bool same_source = true;
+        bool duplicate_view = false;
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            const FrameGenCaptureItem& item = items[i];
+            const auto it = images_.find(item.source.swapchain);
+            if (it == images_.end() || item.source.image_index >= it->second.size()) {
+                if (error.empty()) error = "Frame Generation capture image is not tracked";
+                continue;
+            }
+            if (views_.size() <= item.view) {
+                views_.resize(item.view + 1);
+            }
+            ViewResources& view = views_[item.view];
+            ID3D12Resource* resource = it->second[item.source.image_index];
+            if (!ViewPrepared(view) || !view.history_state.MatchesImages(item.request.extent, resource->GetDesc().Format,
+                                                                         item.request.output)) {
+                continue;
+            }
+            for (const std::size_t prev : eligible) {
+                if (items[prev].view == item.view) {
+                    duplicate_view = true;
+                    break;
+                }
+            }
+            if (!common_source) {
+                common_source = resource;
+            } else if (common_source != resource) {
+                same_source = false;
+            }
+            eligible.push_back(i);
+        }
+        if (eligible.empty()) {
+            return 0;
+        }
+        if (eligible.size() == 1 || !same_source || duplicate_view) {
+            return FrameGenGpu::CaptureBatch(items, quality, error, captured);
+        }
+        const std::size_t slot_index = static_cast<std::size_t>(capture_count_ % capture_slots_.size());
+        CaptureSlot& slot = capture_slots_[slot_index];
+        if (!WaitFence(slot.fence_value, 100, CaptureFence())) {
+            error = "D3D12 Frame Generation capture work did not finish in time";
+            return 0;
+        }
+        KeepCaptureEnd(slot, slot_index);
+        hr = slot.allocator->Reset();
+        if (SUCCEEDED(hr)) hr = capture_commands_->Reset(slot.allocator.Get(), nullptr);
+        if (FAILED(hr)) {
+            error = Failure("D3D12 Frame Generation capture reset", hr);
+            return 0;
+        }
+        StampCapture(slot_index, false);
+        std::vector<D3D12_RESOURCE_BARRIER> barriers;
+        barriers.reserve(eligible.size() + 1);
+        Transition(barriers, common_source, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        for (const std::size_t idx : eligible) {
+            ViewResources& view = views_[items[idx].view];
+            const std::uint8_t newest = view.history_state.Newest();
+            ++view.slot_generation[newest];
+            Require(barriers, view.history[newest], D3D12_RESOURCE_STATE_COPY_DEST);
+        }
+        capture_commands_->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+        barriers.clear();
+
+        const D3D12_RESOURCE_DESC source_desc = common_source->GetDesc();
+        for (const std::size_t idx : eligible) {
+            const FrameGenCaptureItem& item = items[idx];
+            ViewResources& view = views_[item.view];
+            Texture& history = view.history[view.history_state.Newest()];
+            D3D12_TEXTURE_COPY_LOCATION destination{history.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            destination.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION source_location{common_source, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            source_location.SubresourceIndex = item.source.array_index * source_desc.MipLevels;
+            const auto& rect = item.source.rect;
+            const D3D12_BOX box{static_cast<UINT>(rect.offset.x), static_cast<UINT>(rect.offset.y), 0,
+                                static_cast<UINT>(rect.offset.x + rect.extent.width),
+                                static_cast<UINT>(rect.offset.y + rect.extent.height), 1};
+            capture_commands_->CopyTextureRegion(&destination, 0, 0, 0, &source_location, &box);
+        }
+
+        Transition(barriers, common_source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        for (const std::size_t idx : eligible) {
+            ViewResources& view = views_[items[idx].view];
+            Require(barriers, view.history[view.history_state.Newest()], D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+        }
+        capture_commands_->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+        barriers.clear();
+
+        StampCapture(slot_index, true);
+        hr = capture_commands_->Close();
+        if (FAILED(hr)) {
+            error = Failure("D3D12 Frame Generation capture close", hr);
+            for (const std::size_t idx : eligible) {
+                views_[items[idx].view].history_state = {};
+            }
+            return 0;
+        }
+        UINT64 max_work_read = 0;
+        UINT64 max_present_read = 0;
+        for (const std::size_t idx : eligible) {
+            ViewResources& view = views_[items[idx].view];
+            const std::uint8_t newest = view.history_state.Newest();
+            if (separate_) {
+                max_work_read = std::max(max_work_read, view.slot_read[newest]);
+            }
+            if (present_fence_) {
+                max_present_read = std::max(max_present_read, view.slot_read_present[newest]);
+            }
+        }
+        if (separate_ && max_work_read && fence_->GetCompletedValue() < max_work_read) {
+            queue_->Wait(fence_.Get(), max_work_read);
+        }
+        if (present_fence_ && max_present_read && present_fence_->GetCompletedValue() < max_present_read) {
+            queue_->Wait(present_fence_.Get(), max_present_read);
+        }
+        ID3D12CommandList* lists[] = {capture_commands_.Get()};
+        queue_->ExecuteCommandLists(1, lists);
+        hr = separate_ ? queue_->Signal(capture_fence_.Get(), ++capture_value_)
+                       : queue_->Signal(fence_.Get(), ++fence_value_);
+        slot.fence_value = separate_ ? capture_value_ : fence_value_;
+        last_capture_value_ = slot.fence_value; // CaptureMark
+        for (const std::size_t idx : eligible) {
+            MarkUsed(views_[items[idx].view], CaptureFence(), slot.fence_value);
+        }
+        if (FAILED(hr)) {
+            error = Failure("D3D12 Frame Generation capture signal", hr);
+            signal_failed_ = true;
+            return 0;
+        }
+        slot.timed = capture_query_heap_ != nullptr;
+        ++capture_count_;
+        for (const std::size_t idx : eligible) {
+            const FrameGenCaptureItem& item = items[idx];
+            ViewResources& view = views_[item.view];
+            view.capture = {true, item.source.swapchain, item.source.image_index, item.source.array_index, item.source.rect};
+            if (view.engine_pair_next) {
+                view.engine_pair[EngineNewest(view)] = view.capture;
+                view.engine_pair_next = false;
+                view.engine_ready = true;
+            }
+            view.raw_captured = 0;
+            if (captured) (*captured)[idx] = true;
+        }
+        return eligible.size();
     }
 
     // With optical flow hardware in use, records the captured frame's raw
@@ -1255,7 +1419,7 @@ class D3D12FrameGen final : public FrameGenGpu {
         }
         ViewResources& view = views_[index];
         const FrameGenExtent extent = view.history_state.Extent();
-        if (!view.depth[1].resource || extent.width != request.extent.width || extent.height != request.extent.height) {
+        if (!ViewPrepared(view) || extent.width != request.extent.width || extent.height != request.extent.height) {
             return false; // Execute sets the view up first
         }
         ID3D12Resource* resource = it->second[depth.image_index];
@@ -1283,6 +1447,9 @@ class D3D12FrameGen final : public FrameGenGpu {
         HRESULT hr = DeviceRemovedReason();
         if (FAILED(hr)) {
             error = Failure("D3D12 device", hr);
+            return false;
+        }
+        if (!EnsureDepth(view, error)) {
             return false;
         }
         const std::size_t slot_index = capture_count_ % capture_slots_.size();
@@ -1885,6 +2052,9 @@ class D3D12FrameGen final : public FrameGenGpu {
     bool RecordDepthCross(const FrameGenViewSubmission& source_submission,
                           const FrameGenViewSubmission& target_submission, ViewResources& source,
                           ViewResources& target, std::string& error) {
+        if (!source.depth[source.history_state.Newest()].resource || !EnsureDepth(target, error)) {
+            return false;
+        }
         const FrameGenExtent half = FrameGenPyramid(target_submission.request.extent)[1];
         if (!target.cross_keys.resource &&
             !Create(target.cross_keys, half, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_UINT, true, error)) {
@@ -2797,6 +2967,7 @@ class D3D12FrameGen final : public FrameGenGpu {
     }
     std::uint64_t DrawsForTest() const override { return draws_; }
     std::uint64_t ShadingRatesForTest() const override { return shading_rates_; }
+    std::uint64_t CaptureSubmitsForTest() const override { return capture_count_; }
 
     // A wide view's periphery is rendered far denser than a headset shows
     // it: angle per pixel shrinks with the square of the angle's tangent off
@@ -3278,6 +3449,7 @@ class D3D12FrameGen final : public FrameGenGpu {
         for (std::size_t i = 0; i < views.size() && ok; ++i) {
             bool synthesized = false;
             bool depth = false;
+            recordings[i].view_index = i;
             ok = BeginView(views[i], effective_tuning, views_[i], recordings[i], synthesized, depth, evidence, error);
             result.synthesized[i] = synthesized;
             result.depth[i] = depth;
@@ -3427,6 +3599,13 @@ class D3D12FrameGen final : public FrameGenGpu {
                     views_[i].history_state = {};
                 }
             }
+#ifdef DEPTHXR_NVOF
+            if (atlas_.session) {
+                atlas_.newest.state = D3D12_RESOURCE_STATE_COMMON;
+                atlas_.previous.state = D3D12_RESOURCE_STATE_COMMON;
+                atlas_.flow.state = D3D12_RESOURCE_STATE_COMMON;
+            }
+#endif
             analyzed_.clear();
             return false;
         }
@@ -5505,11 +5684,37 @@ class D3D12FrameGen final : public FrameGenGpu {
         return true;
     }
 
-    // Whether EnsureView would keep the view's images (history and depth) as
-    // they are, for a ring of `ring` slots.
+    static bool ViewPrepared(const ViewResources& view) {
+        const FrameGenExtent extent = view.history_state.Extent();
+        return view.history[1].resource != nullptr && extent.width != 0 && extent.height != 0;
+    }
+
+    // A view's linear depth ring, allocated lazily on the first depth capture
+    // or cross-eye depth transfer so sessions without depth never pay its VRAM.
+    bool EnsureDepth(ViewResources& view, std::string& error) {
+        if (view.depth[1].resource) {
+            return true;
+        }
+        const std::uint8_t ring = view.history_state.Ring();
+        const FrameGenExtent extent = view.history_state.Extent();
+        if (ring < 2 || !extent.width || !extent.height) {
+            return false;
+        }
+        const FrameGenExtent half = FrameGenPyramid(extent)[1];
+        for (std::uint8_t slot = 0; slot < ring; ++slot) {
+            if (!Create(view.depth[slot], half, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, true, error)) {
+                view.depth = {};
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Whether EnsureView would keep the view's history images as they are, for
+    // a ring of `ring` slots.
     bool Prepared(const FrameGenViewSubmission& submission, const ViewResources& view, std::uint8_t ring) const {
         const auto it = images_.find(submission.source.swapchain);
-        if (it == images_.end() || submission.source.image_index >= it->second.size() || !view.depth[1].resource ||
+        if (it == images_.end() || submission.source.image_index >= it->second.size() || !ViewPrepared(view) ||
             view.history_state.Ring() != ring) {
             return false;
         }
@@ -5540,6 +5745,7 @@ class D3D12FrameGen final : public FrameGenGpu {
         // Just-in-time synthesis keeps more real frames (see
         // FrameGenHistoryRing): a headset-resolution image per view each.
         const std::uint8_t ring = FrameGenHistoryRing(tuning);
+        const bool was_prepared = ViewPrepared(view);
         const unsigned change = view.history_state.Configure(extent, source_desc.Format, submission.request.output,
                                                               final_level, ring);
         const auto levels = FrameGenPyramid(extent);
@@ -5554,29 +5760,24 @@ class D3D12FrameGen final : public FrameGenGpu {
             analyzed_.clear();
             for (auto& generation : view.slot_generation) ++generation;
         }
-        // The depth textures are created last: they mark a view set up.
-        if (change & FrameGenHistoryState::kAll || !view.depth[1].resource) {
+        if ((change & FrameGenHistoryState::kAll) || !was_prepared) {
             view.capture.valid = false;
             const DXGI_FORMAT view_format = ViewFormat(source_desc.Format, submission.source.format);
-            view.history = {};
-            for (std::uint8_t slot = 0; slot < ring; ++slot) {
-                if (!Create(view.history[slot], extent, source_desc.Format, view_format, false, error)) return false;
-            }
             // Square-root luma in [0, 1] and -1 where invalid: half floats keep
-            // it to a two-thousandth, below what matching costs resolve.
-            for (std::uint8_t level = 1; level <= kFrameGenPyramidLevels; ++level) {
-                if (!Create(view.luma_newest[level], levels[level], DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, true, error) ||
-                    !Create(view.luma_previous[level], levels[level], DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, true, error)) {
-                    return false;
-                }
-                if (level >= 2 && !Create(view.flow[level], levels[level], DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                          DXGI_FORMAT_R16G16B16A16_FLOAT, true, error)) {
-                    return false;
-                }
+            // it to a two-thousandth, below what matching costs resolve. Only
+            // level 1 is always needed; coarser pyramid levels and shader flow
+            // levels are allocated lazily below when shader flow runs.
+            view.luma_newest = {};
+            view.luma_previous = {};
+            view.flow = {};
+            if (!Create(view.luma_newest[1], levels[1], DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, true, error) ||
+                !Create(view.luma_previous[1], levels[1], DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, true, error)) {
+                return false;
             }
-            view.output = {}; // created when first needed (see EnsureOutput)
+            view.output = {};         // created when first needed (see EnsureOutput)
             view.compose_target = {}; // likewise (see EnsureComposeTarget)
-            view.trust = {};  // likewise (see EnsureTrust)
+            view.depth = {};          // likewise (see EnsureDepth)
+            view.trust = {};          // likewise (see EnsureTrust)
             view.shift_keys = {};
             view.shift_map = {};
             view.motion_map = {};
@@ -5589,13 +5790,54 @@ class D3D12FrameGen final : public FrameGenGpu {
             view.depth_scale_raw = {};
             view.depth_scale_votes = {};
             view.trust_stereo = false;
-            view.depth = {};
+            view.depth_ready = false;
+            view.history = {};
             for (std::uint8_t slot = 0; slot < ring; ++slot) {
-                if (!Create(view.depth[slot], levels[1], DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, true, error)) {
+                if (!Create(view.history[slot], extent, source_desc.Format, view_format, false, error)) return false;
+            }
+        } else if (change != FrameGenHistoryState::kNone) {
+            // WaitIdle() already succeeded above: release coarser shader-flow
+            // textures that the new quality/flow mode does not use.
+            if (tuning.hardware_flow) {
+                for (std::uint8_t level = 2; level <= kFrameGenPyramidLevels; ++level) {
+                    view.luma_newest[level] = {};
+                    view.luma_previous[level] = {};
+                    if (level != kFrameGenHardwareFlowLevel) {
+                        view.flow[level] = {};
+                    }
+                }
+            } else {
+                for (std::uint8_t level = 2; level < final_level; ++level) {
+                    view.flow[level] = {};
+                }
+            }
+        }
+        // Lazily allocate only the flow/luma pyramid levels needed by the
+        // active motion path (hardware OFA uses only luma[1] + flow[3]).
+        if (tuning.hardware_flow) {
+            if (!view.flow[kFrameGenHardwareFlowLevel].resource &&
+                !Create(view.flow[kFrameGenHardwareFlowLevel], levels[kFrameGenHardwareFlowLevel],
+                        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, true, error)) {
+                return false;
+            }
+        } else {
+            for (std::uint8_t level = 2; level <= kFrameGenPyramidLevels; ++level) {
+                if (!view.luma_newest[level].resource &&
+                    !Create(view.luma_newest[level], levels[level], DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, true,
+                            error)) {
+                    return false;
+                }
+                if (!view.luma_previous[level].resource &&
+                    !Create(view.luma_previous[level], levels[level], DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, true,
+                            error)) {
+                    return false;
+                }
+                if (level >= final_level && !view.flow[level].resource &&
+                    !Create(view.flow[level], levels[level], DXGI_FORMAT_R16G16B16A16_FLOAT,
+                            DXGI_FORMAT_R16G16B16A16_FLOAT, true, error)) {
                     return false;
                 }
             }
-            view.depth_ready = false;
         }
         if (change != FrameGenHistoryState::kNone || !view.filtered[0].resource) {
             view.filtered = {};
@@ -5884,10 +6126,10 @@ class D3D12FrameGen final : public FrameGenGpu {
         const NV_OF_PERF_LEVEL perf = HardwarePerf(tuning);
         const bool sized = view.hardware_extent.width == input.width && view.hardware_extent.height == input.height;
         if (own_session ? view.hardware && sized && view.hardware_perf == perf
-                        : !view.hardware && view.hardware_newest.resource && sized) {
+                        : !view.hardware && view.hardware_flow.resource && !view.hardware_newest.resource && sized) {
             return true;
         }
-        if ((view.hardware || view.hardware_newest.resource) && !WaitIdle()) {
+        if ((view.hardware || view.hardware_newest.resource || view.hardware_flow.resource) && !WaitIdle()) {
             return HardwareFailed("the GPU did not finish before the optical flow session was resized");
         }
         if (hardware_hung_) {
@@ -5897,10 +6139,13 @@ class D3D12FrameGen final : public FrameGenGpu {
         }
         RetireHardware(view);
         if (!own_session) {
+            // Atlas mode packs directly into atlas_.newest / atlas_.previous
+            // (FG_PASS_FLOW_PACK), so only per-view hardware_flow is needed.
+            view.hardware_newest = {};
+            view.hardware_previous = {};
+            view.hardware_flow = {};
             std::string error;
-            if (!Create(view.hardware_newest, input, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UNORM, true, error, true) ||
-                !Create(view.hardware_previous, input, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UNORM, true, error, true) ||
-                !Create(view.hardware_flow, flow, DXGI_FORMAT_R16G16_SINT, DXGI_FORMAT_R16G16_SINT, false, error, true)) {
+            if (!Create(view.hardware_flow, flow, DXGI_FORMAT_R16G16_SINT, DXGI_FORMAT_R16G16_SINT, false, error, true)) {
                 return HardwareFailed("its images could not be created (" + error + ")");
             }
             view.hardware_extent = input;
@@ -6157,8 +6402,8 @@ class D3D12FrameGen final : public FrameGenGpu {
         std::string error;
         const FrameGenExtent extent{width, height};
         const FrameGenExtent flow{(width + 3) / 4, (height + 3) / 4};
-        if (!Create(atlas_.newest, extent, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UNORM, false, error, true) ||
-            !Create(atlas_.previous, extent, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UNORM, false, error, true) ||
+        if (!Create(atlas_.newest, extent, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UNORM, true, error, true) ||
+            !Create(atlas_.previous, extent, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UNORM, true, error, true) ||
             !Create(atlas_.flow, flow, DXGI_FORMAT_R16G16_SINT, DXGI_FORMAT_R16G16_SINT, false, error, true)) {
             RetireAtlas(atlas_);
             return false;
@@ -6261,37 +6506,22 @@ class D3D12FrameGen final : public FrameGenGpu {
         atlas = {};
     }
 
-    // RunHardwareFlow on the atlas: copies every waiting view's packed images
-    // into its cell, submits, has the hardware match the atlas once, makes
-    // the queue wait for the vectors, reopens the command list and copies
-    // each view's vectors out of its cell into the view's own image.
+    // RunHardwareFlow on the atlas: each waiting view's kFlowPack already
+    // wrote directly into its atlas cell, so transition the atlas to COMMON,
+    // submit, have the hardware match the atlas once, make the queue wait for
+    // the vectors, reopen the command list and copy each view's vectors out of
+    // its cell into the view's own image.
     bool RunHardwareAtlas(std::vector<ViewRecording>& recordings, FrameSlot& slot, std::size_t slot_index,
                           std::string& error) {
         std::vector<D3D12_RESOURCE_BARRIER> barriers;
         auto waiting = [&](std::size_t index) {
             return recordings[index].waits_for_hardware && index < atlas_.cells.size();
         };
-        for (std::size_t index = 0; index < recordings.size(); ++index) {
-            if (!waiting(index)) continue;
-            Require(barriers, recordings[index].view->hardware_newest, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            Require(barriers, recordings[index].view->hardware_previous, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        }
-        Require(barriers, atlas_.newest, D3D12_RESOURCE_STATE_COPY_DEST);
-        Require(barriers, atlas_.previous, D3D12_RESOURCE_STATE_COPY_DEST);
-        Flush(barriers);
         bool temporal = !atlas_.fresh;
         for (std::size_t index = 0; index < recordings.size(); ++index) {
             if (!waiting(index)) continue;
             ViewResources& view = *recordings[index].view;
             temporal = temporal && recordings[index].temporal && !view.hardware_fresh;
-            const auto [x, y] = atlas_.cells[index];
-            for (const auto& [from, to] : {std::pair{&view.hardware_newest, &atlas_.newest},
-                                           std::pair{&view.hardware_previous, &atlas_.previous}}) {
-                D3D12_TEXTURE_COPY_LOCATION destination{to->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-                D3D12_TEXTURE_COPY_LOCATION source{from->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-                destination.SubresourceIndex = source.SubresourceIndex = 0;
-                commands_->CopyTextureRegion(&destination, x, y, 0, &source, nullptr);
-            }
         }
         // The hardware reads and writes its images in COMMON.
         Require(barriers, atlas_.newest, D3D12_RESOURCE_STATE_COMMON);
@@ -6513,58 +6743,72 @@ class D3D12FrameGen final : public FrameGenGpu {
             view.bound_newest >= 0 ? static_cast<std::uint8_t>(view.bound_newest) : view.history_state.Newest();
         const std::uint8_t previous =
             view.bound_previous >= 0 ? static_cast<std::uint8_t>(view.bound_previous) : view.history_state.Previous();
+        Texture* resolved = nullptr;
         switch (texture.kind) {
-        case FrameGenTextureKind::kHistoryNewest: return &view.history[newest];
-        case FrameGenTextureKind::kHistoryPrevious: return &view.history[previous];
-        case FrameGenTextureKind::kLumaNewest: return &view.luma_newest[texture.level];
-        case FrameGenTextureKind::kLumaPrevious: return &view.luma_previous[texture.level];
-        case FrameGenTextureKind::kFlow: return &view.flow[texture.level];
-        case FrameGenTextureKind::kFilteredNewest: return &view.filtered[newest];
-        case FrameGenTextureKind::kFilteredPrevious: return &view.filtered[previous];
-        case FrameGenTextureKind::kFilteredCover: return &view.filtered_cover[newest];
-        case FrameGenTextureKind::kOutput: return &view.output;
-        case FrameGenTextureKind::kDepth: return &view.depth[newest];
-        case FrameGenTextureKind::kDepthPrevious: return &view.depth[previous];
-        case FrameGenTextureKind::kHardwareNewest: return &view.hardware_newest;
-        case FrameGenTextureKind::kHardwarePrevious: return &view.hardware_previous;
-        case FrameGenTextureKind::kHardwareFlow: return view.raw_in_use ? &view.raw_flow : &view.hardware_flow;
-        case FrameGenTextureKind::kTrustNewest: return &view.trust[newest];
-        case FrameGenTextureKind::kTrustPrevious: return &view.trust[previous];
-        case FrameGenTextureKind::kShiftKeys: return &view.shift_keys;
-        case FrameGenTextureKind::kShiftMap: return &view.shift_map;
-        case FrameGenTextureKind::kDepthStale: return &view.depth_stale;
-        case FrameGenTextureKind::kDepthDecided: return &view.depth_decided;
-        case FrameGenTextureKind::kMotionMap: return &view.motion_map;
-        case FrameGenTextureKind::kWorldPartials: return &view.world_partials;
-        case FrameGenTextureKind::kWorldParams: return &view.world_params;
-        case FrameGenTextureKind::kTrustTiles: return &view.trust_tiles;
-        case FrameGenTextureKind::kTrustVotes: return &view.trust_votes;
-        case FrameGenTextureKind::kDepthScales: return &view.depth_scales;
-        case FrameGenTextureKind::kDepthScaleVotes: return &view.depth_scale_votes;
-        case FrameGenTextureKind::kDepthScaleRaw: return &view.depth_scale_raw;
-        case FrameGenTextureKind::kEngineRaw: return &view.engine_raw[EngineNewest(view)];
-        case FrameGenTextureKind::kEngineRawPrevious: return &view.engine_raw[EnginePrevious(view)];
-        case FrameGenTextureKind::kEngineCensus: return &view.engine_census[EngineNewest(view)];
-        case FrameGenTextureKind::kEngineCensusPrevious: return &view.engine_census[EnginePrevious(view)];
-        case FrameGenTextureKind::kEnginePartials: return &view.engine_partials;
-        case FrameGenTextureKind::kEngineParams: return &view.engine_params;
-        case FrameGenTextureKind::kEngineEvidence: return &view.engine_evidence;
-        case FrameGenTextureKind::kEngineCandidate: return &view.engine_candidate;
-        case FrameGenTextureKind::kEngineInfo: return &view.engine_info;
-        case FrameGenTextureKind::kEngineFlow: return &view.engine_flow;
-        case FrameGenTextureKind::kEngineLabels: return &view.engine_labels[newest];
-        case FrameGenTextureKind::kEngineTiles: return &view.engine_tiles[view.engine_tiles_next];
-        case FrameGenTextureKind::kEngineTilesPrevious: return &view.engine_tiles[1u - view.engine_tiles_next];
+        case FrameGenTextureKind::kHistoryNewest: resolved = &view.history[newest]; break;
+        case FrameGenTextureKind::kHistoryPrevious: resolved = &view.history[previous]; break;
+        case FrameGenTextureKind::kLumaNewest: resolved = &view.luma_newest[texture.level]; break;
+        case FrameGenTextureKind::kLumaPrevious: resolved = &view.luma_previous[texture.level]; break;
+        case FrameGenTextureKind::kFlow: resolved = &view.flow[texture.level]; break;
+        case FrameGenTextureKind::kFilteredNewest: resolved = &view.filtered[newest]; break;
+        case FrameGenTextureKind::kFilteredPrevious: resolved = &view.filtered[previous]; break;
+        case FrameGenTextureKind::kFilteredCover: resolved = &view.filtered_cover[newest]; break;
+        case FrameGenTextureKind::kOutput: resolved = &view.output; break;
+        case FrameGenTextureKind::kDepth: resolved = &view.depth[newest]; break;
+        case FrameGenTextureKind::kDepthPrevious: resolved = &view.depth[previous]; break;
+        case FrameGenTextureKind::kHardwareNewest:
+#ifdef DEPTHXR_NVOF
+            resolved = atlas_in_use_ ? &atlas_.newest : &view.hardware_newest;
+#else
+            resolved = &view.hardware_newest;
+#endif
+            break;
+        case FrameGenTextureKind::kHardwarePrevious:
+#ifdef DEPTHXR_NVOF
+            resolved = atlas_in_use_ ? &atlas_.previous : &view.hardware_previous;
+#else
+            resolved = &view.hardware_previous;
+#endif
+            break;
+        case FrameGenTextureKind::kHardwareFlow: resolved = view.raw_in_use ? &view.raw_flow : &view.hardware_flow; break;
+        case FrameGenTextureKind::kTrustNewest: resolved = &view.trust[newest]; break;
+        case FrameGenTextureKind::kTrustPrevious: resolved = &view.trust[previous]; break;
+        case FrameGenTextureKind::kShiftKeys: resolved = &view.shift_keys; break;
+        case FrameGenTextureKind::kShiftMap: resolved = &view.shift_map; break;
+        case FrameGenTextureKind::kDepthStale: resolved = &view.depth_stale; break;
+        case FrameGenTextureKind::kDepthDecided: resolved = &view.depth_decided; break;
+        case FrameGenTextureKind::kMotionMap: resolved = &view.motion_map; break;
+        case FrameGenTextureKind::kWorldPartials: resolved = &view.world_partials; break;
+        case FrameGenTextureKind::kWorldParams: resolved = &view.world_params; break;
+        case FrameGenTextureKind::kTrustTiles: resolved = &view.trust_tiles; break;
+        case FrameGenTextureKind::kTrustVotes: resolved = &view.trust_votes; break;
+        case FrameGenTextureKind::kDepthScales: resolved = &view.depth_scales; break;
+        case FrameGenTextureKind::kDepthScaleVotes: resolved = &view.depth_scale_votes; break;
+        case FrameGenTextureKind::kDepthScaleRaw: resolved = &view.depth_scale_raw; break;
+        case FrameGenTextureKind::kEngineRaw: resolved = &view.engine_raw[EngineNewest(view)]; break;
+        case FrameGenTextureKind::kEngineRawPrevious: resolved = &view.engine_raw[EnginePrevious(view)]; break;
+        case FrameGenTextureKind::kEngineCensus: resolved = &view.engine_census[EngineNewest(view)]; break;
+        case FrameGenTextureKind::kEngineCensusPrevious: resolved = &view.engine_census[EnginePrevious(view)]; break;
+        case FrameGenTextureKind::kEnginePartials: resolved = &view.engine_partials; break;
+        case FrameGenTextureKind::kEngineParams: resolved = &view.engine_params; break;
+        case FrameGenTextureKind::kEngineEvidence: resolved = &view.engine_evidence; break;
+        case FrameGenTextureKind::kEngineCandidate: resolved = &view.engine_candidate; break;
+        case FrameGenTextureKind::kEngineInfo: resolved = &view.engine_info; break;
+        case FrameGenTextureKind::kEngineFlow: resolved = &view.engine_flow; break;
+        case FrameGenTextureKind::kEngineLabels: resolved = &view.engine_labels[newest]; break;
+        case FrameGenTextureKind::kEngineTiles: resolved = &view.engine_tiles[view.engine_tiles_next]; break;
+        case FrameGenTextureKind::kEngineTilesPrevious: resolved = &view.engine_tiles[1u - view.engine_tiles_next]; break;
         case FrameGenTextureKind::kEngineParamsOther:
             // The game's vectors are used with two views alone.
             if (views_.size() >= 2 && (&view == &views_[0] || &view == &views_[1])) {
-                return &views_[&view == &views_[0] ? 1 : 0].engine_params;
+                resolved = &views_[&view == &views_[0] ? 1 : 0].engine_params;
             }
-            return nullptr;
-        case FrameGenTextureKind::kEngineVerdict: return &view.engine_verdict;
-        case FrameGenTextureKind::kWorldParamsNewest: return &view.engine_world[newest];
-        default: return nullptr;
+            break;
+        case FrameGenTextureKind::kEngineVerdict: resolved = &view.engine_verdict; break;
+        case FrameGenTextureKind::kWorldParamsNewest: resolved = &view.engine_world[newest]; break;
+        default: break;
         }
+        return resolved && resolved->resource ? resolved : nullptr;
     }
 
     static void Transition(std::vector<D3D12_RESOURCE_BARRIER>& barriers, ID3D12Resource* resource,
@@ -6878,8 +7122,15 @@ class D3D12FrameGen final : public FrameGenGpu {
                 if (texture) Require(barriers, *texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             }
             Flush(barriers);
+            FrameGenConstants constants = dispatch.constants;
+#ifdef DEPTHXR_NVOF
+            if (dispatch.pass == FrameGenPass::kFlowPack && atlas_in_use_ && recording.view_index < atlas_.cells.size()) {
+                constants.size[2] = atlas_.cells[recording.view_index][0];
+                constants.size[3] = atlas_.cells[recording.view_index][1];
+            }
+#endif
             commands_->SetPipelineState(pipelines_[static_cast<std::size_t>(dispatch.pass)].Get());
-            commands_->SetComputeRoot32BitConstants(0, sizeof(FrameGenConstants) / 4, &dispatch.constants, 0);
+            commands_->SetComputeRoot32BitConstants(0, sizeof(FrameGenConstants) / 4, &constants, 0);
             commands_->SetComputeRootDescriptorTable(1, Gpu(base));
             commands_->SetComputeRootDescriptorTable(2, Gpu(base + kFirstUav));
             commands_->Dispatch((dispatch.width + kFrameGenThreadGroupSize - 1) / kFrameGenThreadGroupSize,
