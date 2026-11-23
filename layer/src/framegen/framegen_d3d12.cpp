@@ -3409,6 +3409,9 @@ class D3D12FrameGen final : public FrameGenGpu {
         for (std::size_t i = 0; i < views.size() && effective_tuning.hardware_flow; ++i) {
             effective_tuning.hardware_flow = EnsureHardware(views_[i], i, views[i], tuning, !atlas_in_use_);
         }
+        if (!effective_tuning.hardware_flow) {
+            atlas_in_use_ = false;
+        }
         if (atlas_in_use_ && effective_tuning.hardware_flow && !EnsureAtlas(views, tuning)) {
             atlas_in_use_ = false;
             if (atlas_busy_) {
@@ -5347,9 +5350,27 @@ class D3D12FrameGen final : public FrameGenGpu {
         };
         for (std::size_t i = 0; i < views.size() && i < views_.size(); ++i) {
             ViewResources& view = views_[i];
-            if (!copy(view.history[view.history_state.Newest()], "view" + std::to_string(i) + "-color.raw") ||
-                !copy(view.depth[view.history_state.Newest()], "view" + std::to_string(i) + "-depth.f32")) {
+            if (!copy(view.history[view.history_state.Newest()], "view" + std::to_string(i) + "-color.raw")) {
                 return false;
+            }
+            const std::string depth_name = "view" + std::to_string(i) + "-depth.f32";
+            Texture& depth_texture = view.depth[view.history_state.Newest()];
+            if (depth_texture.resource) {
+                if (!copy(depth_texture, depth_name)) {
+                    return false;
+                }
+            } else {
+                // Lazy depth is unallocated when depth was never captured: keep the
+                // capture/replay file contract (zeroed half-res f32) without VRAM.
+                const FrameGenExtent half = FrameGenPyramid(views[i].request.extent)[1];
+                if (half.width > 0 && half.height > 0) {
+                    DumpCopy entry;
+                    entry.name = depth_name;
+                    entry.rows = half.height;
+                    entry.row_bytes = static_cast<UINT64>(half.width) * 4;
+                    entry.format = DXGI_FORMAT_R32_FLOAT;
+                    dump.push_back(std::move(entry));
+                }
             }
             if (i < recordings.size() && recordings[i].engine &&
                 !copy(view.engine_raw[EngineNewest(view)], "view" + std::to_string(i) + "-engine-raw." +
@@ -5370,6 +5391,16 @@ class D3D12FrameGen final : public FrameGenGpu {
         // so the game only waits for this Execute to finish on the GPU.
         StartWriter([entries = std::move(dump), directory = dump_directory_]() mutable {
             for (DumpCopy& entry : entries) {
+                if (!entry.buffer) {
+                    if (entry.rows > 0 && entry.row_bytes > 0) {
+                        std::ofstream file(directory + "\\" + entry.name, std::ios::binary);
+                        std::vector<char> zeros(static_cast<std::size_t>(entry.row_bytes), 0);
+                        for (UINT row = 0; row < entry.rows && file; ++row) {
+                            file.write(zeros.data(), static_cast<std::streamsize>(entry.row_bytes));
+                        }
+                    }
+                    continue;
+                }
                 void* mapped = nullptr;
                 if (FAILED(entry.buffer->Map(0, nullptr, &mapped))) {
                     continue;

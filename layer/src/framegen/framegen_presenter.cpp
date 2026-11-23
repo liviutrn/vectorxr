@@ -1351,6 +1351,8 @@ void FrameGenPresenter::Configure(const FrameGenResolvedSettings& settings) {
         multiplier_changed_at_ = now;
         cadence_.clear();
         dynamic_below_since_.reset();
+        dynamic_rate_ok_windows_ = 0;
+        dynamic_rate_confirmed_ = false;
         // The ring's ceilings are keyed by multiplier, and their floors
         // follow the mode (a refresh per real frame for Dynamic): one learned
         // under Dynamic capped a fixed 2x run below what its ring holds.
@@ -1366,6 +1368,8 @@ void FrameGenPresenter::Configure(const FrameGenResolvedSettings& settings) {
     }
     if (restart) {
         healthy_streak_ = 0;
+        dynamic_rate_ok_windows_ = 0;
+        dynamic_rate_confirmed_ = false;
         ++totals_.restarts; // the benefit guard's window says nothing about either mode
         if (state_ == FrameGenState::kActive) {
             SetStateLocked(FrameGenState::kWaiting, "");
@@ -1989,6 +1993,8 @@ bool FrameGenPresenter::ResetFrames() {
     presenter_frame_open_ = false;
     frames_.clear();
     healthy_streak_ = 0;
+    dynamic_rate_ok_windows_ = 0;
+    dynamic_rate_confirmed_ = false;
     interpolate_flow_selected_.reset();
     interpolate_flow_window_.reset();
     interpolate_flow_bad_windows_ = 0;
@@ -4052,7 +4058,7 @@ void FrameGenPresenter::UpdateDynamicLocked(Clock::time_point now, XrDuration pe
                             (dynamic_rate_check_ == DynamicRateCheck::kInitial && !dynamic_rate_confirmed_);
     const bool rate_slow = passthrough_fps_ > 0.0 && app_rate < policy.game_rate_share * passthrough_fps_;
     if (dynamic_rate_check_ == DynamicRateCheck::kInitial && !dynamic_rate_confirmed_ && passthrough_fps_ > 0.0) {
-        if (rate_slow) {
+        if (rate_slow || !winning) {
             dynamic_rate_ok_windows_ = 0;
         } else if (++dynamic_rate_ok_windows_ >= 2) {
             dynamic_rate_confirmed_ = true;

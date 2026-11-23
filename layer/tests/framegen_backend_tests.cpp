@@ -11185,9 +11185,10 @@ void Sprint1VramAndBatchedCaptureTest(Harness& harness, ID3D12Device* device) {
             // Mid-session fallback from hardware OFA -> shader flow lazily allocates pyramid levels cleanly.
             FrameGenTuning sw_tuning = hw_tuning;
             sw_tuning.hardware_flow = false;
+            auto sw_views = make_views(0, true);
             Check(hw_gpu->CaptureBatch(batch0, sw_tuning.quality, error) == 2, "Sprint1 HW->SW batch: " + error);
             res = {};
-            Check(hw_gpu->Execute(views0, sw_tuning, res, error) && hw_gpu->WaitIdle(),
+            Check(hw_gpu->Execute(sw_views, sw_tuning, res, error) && hw_gpu->WaitIdle(),
                   "Sprint1 HW->SW lazy fallback Execute failed: " + error);
             Check(hw_gpu->WorkingMemoryBytes() > actual_hw,
                   "Sprint1 HW->SW fallback did not lazily allocate shader pyramid");
